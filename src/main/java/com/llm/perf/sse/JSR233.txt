@@ -1,0 +1,61 @@
+import com.google.gson.Gson
+import com.llm.perf.sse.SseMetrics
+
+Gson gson = new Gson()
+String json = prev.getSamplerData()
+if(json != null && !json.isEmpty()){
+    SseMetrics metrics = gson.fromJson(json, SseMetrics.class)
+    log.info("metrics={}", metrics.toString())
+    long ttft = metrics.getTTFT()
+    double tpot = metrics.getTPOT()
+}
+
+
+
+
+
+     Headers 填写格式（每行一个 key:value）：
+
+     Content-Type: application/json
+     Authorization: Bearer sk-xxxxxx
+     Accept: text/event-stream
+     Custom-Header: custom-value
+
+     注意：
+
+     - 冒号 : 分隔键值，首个冒号后的内容作为 value（支持 value 中包含冒号）
+     - 行首尾空格会自动 trim()
+     - 空行会被忽略
+     - Content-Type 默认建议填 application/json
+
+------------------------
+
+     不需要 import SseMetrics，也不需要用 Gson。Groovy 自带 JsonSlurper 更简单：
+
+     import groovy.json.JsonSlurper
+
+     def json = prev.getSamplerData()
+     if (json) {
+         def metrics = new JsonSlurper().parseText(json)
+         log.info("metrics: $metrics")
+         def ttft = metrics.TTFT?.longValue() ?: -1
+         def tpot = metrics.TPOT?.doubleValue() ?: -1
+         // 直接用字段名：TTFT, TTFB, TPOT, TokenPerSec, TotalRT, inputTokens, outputTokens,
+     tokenCount
+     }
+
+     字段名（与 SseMetrics.toString() 一致）：
+
+     - TTFT (long)
+     - TTFB (long)
+     - TPOT (double)
+     - TokenPerSec (double)
+     - TotalRT (long)
+     - inputTokens (long)
+     - outputTokens (long)
+     - tokenCount (long)
+
+     优势：零依赖、无类加载问题、脚本更简洁。
+
+
+---------
