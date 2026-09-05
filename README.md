@@ -2,6 +2,8 @@
 
 一个用于测试流式 LLM API（如 OpenAI Chat Completions Stream）性能的 JMeter 插件。
 
+> Developed by [7DGroup](https://github.com/7dgroup-ai)
+
 ## 功能特性
 
 - 支持 SSE (Server-Sent Events) 协议解析
