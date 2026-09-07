@@ -7,7 +7,13 @@ import org.apache.jmeter.testelement.TestElement;
 import org.apache.jmeter.visualizers.gui.AbstractVisualizer;
 
 import javax.swing.*;
+import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableModel;
 import java.awt.*;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.StringSelection;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 
@@ -32,11 +38,18 @@ import java.util.Date;
  */
 public class SseMetricsListenerGui extends AbstractVisualizer {
     private static final long serialVersionUID = 1L;
-    /** 日志面板最大显示条数 */
+    /** 表格最大显示条数 */
     private static final int MAX_LOG_ENTRIES = 500;
+    /** 表格列名 */
+    private static final String[] COLUMN_NAMES = {
+            "#", "Timestamp", "TTFT(ms)", "TTFB(ms)", "TPOT(ms/t)", "Token/s",
+            "TotalRT(ms)", "In", "Out", "Chunks"
+    };
 
     /** 采样计数 */
     private long sampleCount = 0;
+    /** 解析失败计数 */
+    private long errorCount = 0;
     /** TTFT/TTFB/TotalRT 累加值 */
     private long sumTtft = 0, sumTtfb = 0, sumTotalRt = 0;
     /** TPOT/Tps 累加值 */
@@ -48,10 +61,10 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
     /** TTFT 的最小值和最大值 */
     private long minTtft = Long.MAX_VALUE, maxTtft = Long.MIN_VALUE;
 
-    /** 日志数据模型 */
-    private final DefaultListModel<String> logModel = new DefaultListModel<>();
-    /** 日志列表组件 */
-    private JList<String> logList;
+    /** 表格数据模型 */
+    private DefaultTableModel tableModel;
+    /** 表格组件 */
+    private JTable table;
     /** 统计标签组件 */
     private JLabel countLabel;
     private JLabel avgTtftLabel, minTtftLabel, maxTtftLabel;
@@ -60,6 +73,7 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
     private JLabel avgTpsLabel;
     private JLabel avgTotalRtLabel;
     private JLabel totalInputTokensLabel, totalOutputTokensLabel;
+    private JLabel errorLabel;
     /** JSON 反序列化器 */
     private final Gson gson = new Gson();
     /** 时间格式化器 */
@@ -92,8 +106,11 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
         avgTotalRtLabel = new JLabel("-");
         totalInputTokensLabel = new JLabel("0");
         totalOutputTokensLabel = new JLabel("0");
+        errorLabel = new JLabel("0");
 
         statsPanel.add(createStatItem("Samples:", countLabel));
+        statsPanel.add(Box.createHorizontalStrut(10));
+        statsPanel.add(createStatItem("Errors:", errorLabel));
         statsPanel.add(Box.createHorizontalStrut(10));
         statsPanel.add(createStatItem("TTFT avg(ms):", avgTtftLabel));
         statsPanel.add(Box.createHorizontalStrut(10));
@@ -115,11 +132,70 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
 
         add(statsPanel, BorderLayout.NORTH);
 
-        // 样本日志面板
-        logList = new JList<>(logModel);
-        logList.setFont(new Font("Monospaced", Font.PLAIN, 12));
-        JScrollPane scrollPane = new JScrollPane(logList);
-        scrollPane.setBorder(BorderFactory.createTitledBorder("Sample Log (last " + MAX_LOG_ENTRIES + ")"));
+        // 样本表格面板
+        tableModel = new DefaultTableModel(COLUMN_NAMES, 0) {
+            @Override
+            public boolean isCellEditable(int row, int column) {
+                return false;
+            }
+        };
+        table = new JTable(tableModel);
+        table.setFont(new Font("Monospaced", Font.PLAIN, 12));
+        table.setRowHeight(22);
+        table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        table.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
+        table.getTableHeader().setReorderingAllowed(false);
+        table.getTableHeader().setFont(new Font("Dialog", Font.BOLD, 12));
+
+        // 设置列宽
+        table.getColumnModel().getColumn(0).setPreferredWidth(40);   // #
+        table.getColumnModel().getColumn(1).setPreferredWidth(100);  // Timestamp
+        table.getColumnModel().getColumn(2).setPreferredWidth(70);   // TTFT
+        table.getColumnModel().getColumn(3).setPreferredWidth(70);   // TTFB
+        table.getColumnModel().getColumn(4).setPreferredWidth(80);   // TPOT
+        table.getColumnModel().getColumn(5).setPreferredWidth(70);   // Token/s
+        table.getColumnModel().getColumn(6).setPreferredWidth(80);   // TotalRT
+        table.getColumnModel().getColumn(7).setPreferredWidth(50);   // In
+        table.getColumnModel().getColumn(8).setPreferredWidth(50);   // Out
+        table.getColumnModel().getColumn(9).setPreferredWidth(60);   // Chunks
+
+        // 右键菜单
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                handlePopup(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                handlePopup(e);
+            }
+
+            private void handlePopup(MouseEvent e) {
+                if (e.isPopupTrigger()) {
+                    JPopupMenu popup = new JPopupMenu();
+
+                    JMenuItem copySelected = new JMenuItem("Copy Selected (TSV)");
+                    copySelected.addActionListener(a -> copyToClipboard(false));
+                    popup.add(copySelected);
+
+                    JMenuItem copyAll = new JMenuItem("Copy All (TSV)");
+                    copyAll.addActionListener(a -> copyToClipboard(true));
+                    popup.add(copyAll);
+
+                    popup.addSeparator();
+
+                    JMenuItem clearAll = new JMenuItem("Clear All");
+                    clearAll.addActionListener(a -> clearData());
+                    popup.add(clearAll);
+
+                    popup.show(table, e.getX(), e.getY());
+                }
+            }
+        });
+
+        JScrollPane scrollPane = new JScrollPane(table);
+        scrollPane.setBorder(BorderFactory.createTitledBorder("Sample Results (last " + MAX_LOG_ENTRIES + ")"));
         add(scrollPane, BorderLayout.CENTER);
     }
 
@@ -132,50 +208,79 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
      * @param result JMeter 采样结果
      */
     @Override
-    public void add(SampleResult result) {
+    public synchronized void add(SampleResult result) {
         String data = result.getResponseDataAsString();
         if (data == null || data.isEmpty()) return;
 
         try {
             SseMetrics metrics = gson.fromJson(data, SseMetrics.class);
+            if (metrics == null) {
+                addError("null response");
+                return;
+            }
 
             sampleCount++;
 
-            // 累加有效指标（>= 0 表示有有效数据）
             long ttft = metrics.getTTFT();
+            long ttfb = metrics.getTTFB();
+            double tpot = metrics.getTPOT();
+            double tps = metrics.getTokenPerSec();
+            long totalRt = metrics.getTotalRT();
+
+            // 累加有效指标（>= 0 表示有有效数据）
             if (ttft >= 0) {
                 sumTtft += ttft;
                 validTtft++;
                 minTtft = Math.min(minTtft, ttft);
                 maxTtft = Math.max(maxTtft, ttft);
             }
-            if (metrics.getTTFB() >= 0) { sumTtfb += metrics.getTTFB(); validTtfb++; }
-            if (metrics.getTPOT() >= 0) { sumTpot += metrics.getTPOT(); validTpot++; }
-            if (metrics.getTokenPerSec() >= 0) { sumTps += metrics.getTokenPerSec(); validTps++; }
-            if (metrics.getTotalRT() >= 0) { sumTotalRt += metrics.getTotalRT(); validTotalRt++; }
+            if (ttfb >= 0) { sumTtfb += ttfb; validTtfb++; }
+            if (tpot >= 0) { sumTpot += tpot; validTpot++; }
+            if (tps >= 0) { sumTps += tps; validTps++; }
+            if (totalRt >= 0) { sumTotalRt += totalRt; validTotalRt++; }
             totalIn += metrics.inputTokens;
             totalOut += metrics.outputTokens;
 
-            // 构建日志条目
+            // 构建表格行数据
             String timestamp = sdf.format(new Date());
-            String entry = String.format(
-                    "[%s] TTFT=%d TTFB=%d TPOT=%.2f Tps=%.2f TotalRT=%d in=%d out=%d n=%d",
-                    timestamp, ttft, metrics.getTTFB(),
-                    metrics.getTPOT(), metrics.getTokenPerSec(), metrics.getTotalRT(),
-                    metrics.inputTokens, metrics.outputTokens, metrics.tokenCount);
+            Object[] row = {
+                    sampleCount,
+                    timestamp,
+                    ttft >= 0 ? ttft : "-",
+                    ttfb >= 0 ? ttfb : "-",
+                    tpot >= 0 ? String.format("%.2f", tpot) : "-",
+                    tps >= 0 ? String.format("%.2f", tps) : "-",
+                    totalRt >= 0 ? totalRt : "-",
+                    metrics.inputTokens,
+                    metrics.outputTokens,
+                    metrics.tokenCount
+            };
 
             // 在 EDT 线程中更新 GUI
             SwingUtilities.invokeLater(() -> {
-                // 保持日志条数不超过上限，超过时移除最早的条目
-                if (logModel.size() >= MAX_LOG_ENTRIES) {
-                    logModel.removeRange(0, logModel.size() - MAX_LOG_ENTRIES + 10);
+                // 保持表格条数不超过上限，超过时移除最早的条目
+                while (tableModel.getRowCount() >= MAX_LOG_ENTRIES) {
+                    tableModel.removeRow(0);
                 }
-                logModel.addElement(entry);
+                tableModel.addRow(row);
                 updateStatsLabels();
             });
-        } catch (Exception ignored) {
-            // 静默忽略解析异常，避免影响其他采样结果
+        } catch (Exception e) {
+            addError(e.getMessage());
         }
+    }
+
+    /**
+     * 记录解析错误并更新错误计数。
+     *
+     * @param detail 错误详情
+     */
+    private void addError(String detail) {
+        errorCount++;
+        SwingUtilities.invokeLater(() -> {
+            errorLabel.setText(String.valueOf(errorCount));
+            errorLabel.setForeground(Color.RED);
+        });
     }
 
     /**
@@ -211,11 +316,57 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
     }
 
     /**
+     * 将表格数据复制到系统剪贴板（TSV 格式，可粘贴到 Excel）。
+     *
+     * @param all true=复制全部, false=仅复制选中行
+     */
+    private void copyToClipboard(boolean all) {
+        StringBuilder sb = new StringBuilder();
+        // 写入表头
+        for (int i = 0; i < tableModel.getColumnCount(); i++) {
+            if (i > 0) sb.append("\t");
+            sb.append(tableModel.getColumnName(i));
+        }
+        sb.append("\n");
+
+        // 写入数据行
+        if (all) {
+            for (int row = 0; row < tableModel.getRowCount(); row++) {
+                appendRow(sb, row);
+            }
+        } else {
+            int[] selectedRows = table.getSelectedRows();
+            for (int row : selectedRows) {
+                appendRow(sb, row);
+            }
+        }
+
+        Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+        clipboard.setContents(new StringSelection(sb.toString()), null);
+    }
+
+    /**
+     * 将指定行的数据追加到 StringBuilder。
+     *
+     * @param sb 目标 StringBuilder
+     * @param row 行索引
+     */
+    private void appendRow(StringBuilder sb, int row) {
+        for (int col = 0; col < tableModel.getColumnCount(); col++) {
+            if (col > 0) sb.append("\t");
+            Object value = tableModel.getValueAt(row, col);
+            sb.append(value != null ? value.toString() : "");
+        }
+        sb.append("\n");
+    }
+
+    /**
      * 清除所有统计数据和日志。
      */
     @Override
     public void clearData() {
         sampleCount = 0;
+        errorCount = 0;
         sumTtft = sumTtfb = sumTotalRt = 0;
         sumTpot = sumTps = 0;
         totalIn = totalOut = 0;
@@ -223,17 +374,21 @@ public class SseMetricsListenerGui extends AbstractVisualizer {
         minTtft = Long.MAX_VALUE;
         maxTtft = Long.MIN_VALUE;
 
-        logModel.clear();
-        countLabel.setText("0");
-        avgTtftLabel.setText("-");
-        minTtftLabel.setText("-");
-        maxTtftLabel.setText("-");
-        avgTtfbLabel.setText("-");
-        avgTpotLabel.setText("-");
-        avgTpsLabel.setText("-");
-        avgTotalRtLabel.setText("-");
-        totalInputTokensLabel.setText("0");
-        totalOutputTokensLabel.setText("0");
+        SwingUtilities.invokeLater(() -> {
+            tableModel.setRowCount(0);
+            countLabel.setText("0");
+            errorLabel.setText("0");
+            errorLabel.setForeground(Color.BLACK);
+            avgTtftLabel.setText("-");
+            minTtftLabel.setText("-");
+            maxTtftLabel.setText("-");
+            avgTtfbLabel.setText("-");
+            avgTpotLabel.setText("-");
+            avgTpsLabel.setText("-");
+            avgTotalRtLabel.setText("-");
+            totalInputTokensLabel.setText("0");
+            totalOutputTokensLabel.setText("0");
+        });
     }
 
     /**
