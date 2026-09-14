@@ -20,6 +20,7 @@ public class SseStreamSamplerGui extends AbstractSamplerGui {
     private JTextArea taHeaders;
     private JTextField tfConnectTimeout;
     private JTextField tfReadTimeout;
+    private JComboBox<String> cbApiType;
     private JLabel lblUrlError;
     private JLabel lblBodyError;
     private JLabel lblTimeoutError;
@@ -43,6 +44,11 @@ public class SseStreamSamplerGui extends AbstractSamplerGui {
         urlPanel.add(lblUrlError, BorderLayout.NORTH);
         urlPanel.add(createLabelPanel("SSE Url (*必填):", tfUrl), BorderLayout.CENTER);
         mainPanel.add(urlPanel);
+
+        // API 类型选择
+        cbApiType = new JComboBox<>(new String[]{"openai", "dify", "claude", "gemini"});
+        cbApiType.setSelectedItem("openai");
+        mainPanel.add(createLabelPanel("API Type (*必填):", cbApiType));
 
         JPanel headerPanel = new JPanel(new BorderLayout());
         taHeaders = new JTextArea(4, 60);
@@ -189,6 +195,7 @@ public class SseStreamSamplerGui extends AbstractSamplerGui {
         sampler.setProperty(SseStreamSampler.HEADERS, taHeaders.getText());
         sampler.setProperty(SseStreamSampler.CONNECT_TIMEOUT, tfConnectTimeout.getText().trim());
         sampler.setProperty(SseStreamSampler.READ_TIMEOUT, tfReadTimeout.getText().trim());
+        sampler.setProperty(SseStreamSampler.API_TYPE, cbApiType.getSelectedItem().toString());
     }
 
     @Override
@@ -200,6 +207,8 @@ public class SseStreamSamplerGui extends AbstractSamplerGui {
         taHeaders.setText(sampler.getPropertyAsString(SseStreamSampler.HEADERS));
         tfConnectTimeout.setText(sampler.getPropertyAsString(SseStreamSampler.CONNECT_TIMEOUT));
         tfReadTimeout.setText(sampler.getPropertyAsString(SseStreamSampler.READ_TIMEOUT));
+        String apiType = sampler.getPropertyAsString(SseStreamSampler.API_TYPE, "openai");
+        cbApiType.setSelectedItem(apiType);
     }
 
     @Override

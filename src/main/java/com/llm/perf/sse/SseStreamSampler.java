@@ -47,6 +47,16 @@ public class SseStreamSampler extends AbstractSampler {
     public static final String CONNECT_TIMEOUT = "SseStreamSampler.connectTimeout";
     /** 读取超时时间（毫秒），默认 60000 */
     public static final String READ_TIMEOUT = "SseStreamSampler.readTimeout";
+    /** API 类型配置属性键，支持 openai、dify、claude 和 gemini */
+    public static final String API_TYPE = "SseStreamSampler.apiType";
+    /** API 类型常量：OpenAI */
+    public static final String API_TYPE_OPENAI = "openai";
+    /** API 类型常量：Dify */
+    public static final String API_TYPE_DIFY = "dify";
+    /** API 类型常量：Anthropic Claude */
+    public static final String API_TYPE_CLAUDE = "claude";
+    /** API 类型常量：Google Gemini */
+    public static final String API_TYPE_GEMINI = "gemini";
 
     /** HTTP 连接池管理器，支持并发请求 */
     private static final PoolingHttpClientConnectionManager CONNECTION_MANAGER = new PoolingHttpClientConnectionManager();
@@ -92,6 +102,7 @@ public class SseStreamSampler extends AbstractSampler {
         String body = getPropertyAsString(REQUEST_BODY);
         int connectTimeout = getPropertyAsInt(CONNECT_TIMEOUT, 10000);
         int readTimeout = getPropertyAsInt(READ_TIMEOUT, 60000);
+        String apiType = getPropertyAsString(API_TYPE, API_TYPE_OPENAI);
 
         // 参数校验
         if (urlStr == null || urlStr.trim().isEmpty()) {
@@ -169,8 +180,22 @@ public class SseStreamSampler extends AbstractSampler {
                         JsonObject json = evt.getJsonPayload();
                         if (json == null) continue;
 
-                        // 处理 delta.content（token 内容）
-                        processDeltaContent(json, now, metrics);
+                        // 根据 API 类型处理 token 内容
+                        switch (apiType) {
+                            case API_TYPE_DIFY:
+                                processDifyContent(json, now, metrics);
+                                break;
+                            case API_TYPE_CLAUDE:
+                                processClaudeContent(json, now, metrics);
+                                break;
+                            case API_TYPE_GEMINI:
+                                processGeminiContent(json, now, metrics);
+                                break;
+                            default:
+                                // OpenAI 格式
+                                processDeltaContent(json, now, metrics);
+                                break;
+                        }
                         // 处理 usage 信息（token 统计）
                         processUsage(json, metrics);
                     }
@@ -242,6 +267,66 @@ public class SseStreamSampler extends AbstractSampler {
     }
 
     /**
+     * 处理 Dify 格式的 SSE 事件。
+     *
+     * <p>Dify 格式的 SSE 响应结构：</p>
+     * <pre>
+     * data: {"event":"message","answer":"Hello"}
+     * data: {"event":"agent_message","answer":" world"}
+     * data: {"event":"message_end","metadata":{"usage":{...}}}
+     * </pre>
+     *
+     * <p>支持的事件类型：</p>
+     * <ul>
+     *   <li>message - 消息事件，包含 answer 字段</li>
+     *   <li>agent_message - Agent 消息事件，包含 answer 字段</li>
+     *   <li>text_chunk - 文本块事件，包含 text 字段</li>
+     * </ul>
+     *
+     * @param json SSE 事件的 JSON payload
+     * @param now 当前时间戳（毫秒）
+     * @param metrics 指标收集器
+     */
+    private void processDifyContent(JsonObject json, long now, SseMetrics metrics) {
+        if (!json.has("event") || json.get("event").isJsonNull()) return;
+
+        String eventType = json.get("event").getAsString();
+        if (eventType == null) return;
+
+        String content = null;
+
+        // 根据事件类型提取内容
+        switch (eventType) {
+            case "message":
+            case "agent_message":
+                // 消息事件，从 answer 字段提取内容
+                if (json.has("answer") && !json.get("answer").isJsonNull()) {
+                    content = json.get("answer").getAsString();
+                }
+                break;
+            case "text_chunk":
+                // 文本块事件，从 text 字段提取内容
+                if (json.has("text") && !json.get("text").isJsonNull()) {
+                    content = json.get("text").getAsString();
+                }
+                break;
+            default:
+                // 其他事件类型（如 workflow_started, node_finished 等）不处理
+                return;
+        }
+
+        // 处理提取到的内容
+        if (content != null && !content.isEmpty()) {
+            metrics.tokenCount++;
+            metrics.lastTokenTime = now;
+            // 首次收到有效内容时记录 TTFT
+            if (metrics.firstTokenTime == -1) {
+                metrics.firstTokenTime = now;
+            }
+        }
+    }
+
+    /**
      * 处理 SSE 事件中的 usage 信息。
      *
      * <p>OpenAI 格式的 usage 结构：</p>
@@ -262,6 +347,125 @@ public class SseStreamSampler extends AbstractSampler {
         }
         if (usage.has("completion_tokens")) {
             metrics.outputTokens = usage.get("completion_tokens").getAsLong();
+        }
+    }
+
+    /**
+     * 处理 Anthropic Claude 格式的 SSE 事件。
+     *
+     * <p>Claude 格式的 SSE 响应结构：</p>
+     * <pre>
+     * event: message_start
+     * data: {"type":"message_start","message":{"id":"msg_...","type":"message","role":"assistant","model":"claude-3-opus-20240229","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":11,"output_tokens":1}}}
+     * 
+     * event: content_block_start
+     * data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+     * 
+     * event: content_block_delta
+     * data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+     * 
+     * event: content_block_stop
+     * data: {"type":"content_block_stop","index":0}
+     * 
+     * event: message_delta
+     * data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}
+     * 
+     * event: message_stop
+     * data: {"type":"message_stop"}
+     * </pre>
+     *
+     * <p>主要处理 content_block_delta 事件中的 text_delta 文本内容。</p>
+     *
+     * @param json SSE 事件的 JSON payload
+     * @param now 当前时间戳（毫秒）
+     * @param metrics 指标收集器
+     */
+    private void processClaudeContent(JsonObject json, long now, SseMetrics metrics) {
+        if (!json.has("type")) return;
+
+        String eventType = json.get("type").getAsString();
+        if (eventType == null) return;
+
+        // 处理 content_block_delta 事件，提取文本内容
+        if ("content_block_delta".equals(eventType)) {
+            if (!json.has("delta") || json.get("delta").isJsonNull()) return;
+            JsonObject delta = json.getAsJsonObject("delta");
+            if (!delta.has("text") || delta.get("text").isJsonNull()) return;
+
+            String text = delta.get("text").getAsString();
+            if (text != null && !text.isEmpty()) {
+                metrics.tokenCount++;
+                metrics.lastTokenTime = now;
+                // 首次收到有效内容时记录 TTFT
+                if (metrics.firstTokenTime == -1) {
+                    metrics.firstTokenTime = now;
+                }
+            }
+        }
+        // 处理 message_delta 事件，提取 usage 信息
+        else if ("message_delta".equals(eventType)) {
+            if (json.has("usage") && !json.get("usage").isJsonNull()) {
+                JsonObject usage = json.getAsJsonObject("usage");
+                if (usage.has("output_tokens")) {
+                    metrics.outputTokens = usage.get("output_tokens").getAsLong();
+                }
+            }
+        }
+    }
+
+    /**
+     * 处理 Google Gemini 格式的 SSE 事件。
+     *
+     * <p>Gemini Interactions API 格式的 SSE 响应结构：</p>
+     * <pre>
+     * data: {"event_type":"step.start","step":{"id":"...","type":"model_output","index":0}}
+     * data: {"event_type":"step.delta","step":{"id":"...","type":"model_output","index":0},"delta":{"type":"text","text":"Hello"}}
+     * data: {"event_type":"step.stop","step":{"id":"...","type":"model_output","index":0}}
+     * data: {"event_type":"interaction.completed","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30}}
+     * </pre>
+     *
+     * <p>主要处理 step.delta 事件中的 text delta 内容。</p>
+     *
+     * @param json SSE 事件的 JSON payload
+     * @param now 当前时间戳（毫秒）
+     * @param metrics 指标收集器
+     */
+    private void processGeminiContent(JsonObject json, long now, SseMetrics metrics) {
+        if (!json.has("event_type")) return;
+
+        String eventType = json.get("event_type").getAsString();
+        if (eventType == null) return;
+
+        // 处理 step.delta 事件，提取文本内容
+        if ("step_delta".equals(eventType) || "step.delta".equals(eventType)) {
+            if (!json.has("delta") || json.get("delta").isJsonNull()) return;
+            JsonObject delta = json.getAsJsonObject("delta");
+            if (!delta.has("text") || delta.get("text").isJsonNull()) return;
+
+            String text = delta.get("text").getAsString();
+            if (text != null && !text.isEmpty()) {
+                metrics.tokenCount++;
+                metrics.lastTokenTime = now;
+                // 首次收到有效内容时记录 TTFT
+                if (metrics.firstTokenTime == -1) {
+                    metrics.firstTokenTime = now;
+                }
+            }
+        }
+        // 处理 interaction.completed 事件，提取 usage 信息
+        else if ("interaction_completed".equals(eventType) || "interaction.completed".equals(eventType)) {
+            if (json.has("usageMetadata") && !json.get("usageMetadata").isJsonNull()) {
+                JsonObject usage = json.getAsJsonObject("usageMetadata");
+                if (usage.has("promptTokenCount")) {
+                    metrics.inputTokens = usage.get("promptTokenCount").getAsLong();
+                }
+                if (usage.has("candidatesTokenCount")) {
+                    metrics.outputTokens = usage.get("candidatesTokenCount").getAsLong();
+                }
+                if (usage.has("totalTokenCount")) {
+                    metrics.tokenCount = usage.get("totalTokenCount").getAsLong();
+                }
+            }
         }
     }
 
