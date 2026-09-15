@@ -37,6 +37,10 @@ public class SseMetrics {
     public long outputTokens = 0;
     /** 已接收的 token 总数（逐 chunk 累加） */
     public long tokenCount = 0;
+    /** 最大相邻 token 间隔（毫秒），用于检测断流/卡顿 */
+    public long maxTokenGap = 0;
+    /** 卡顿次数：相邻 token 间隔超过阈值（默认 1s）的次数 */
+    public long stallCount = 0;
 
     /**
      * 计算 TTFT (Time To First Token) - 首个 token 延迟。
@@ -134,6 +138,40 @@ public class SseMetrics {
     }
 
     /**
+     * 计算首字节到首个 token 的生成准备时间。
+     *
+     * <p>计算公式：firstTokenTime - firstByteTime，用于区分网络延迟
+     * （TTFB）与模型首 token 生成延迟。</p>
+     *
+     * @return 毫秒数，异常返回 -1
+     */
+    public long getTTFTMinusTTFB() {
+        if (firstTokenTime <= 0 || firstByteTime <= 0) {
+            return -1;
+        }
+        return Math.max(0, firstTokenTime - firstByteTime);
+    }
+
+    /**
+     * 计算基于 usage 的真实 Token/s。
+     *
+     * <p>使用 outputTokens（usage.completion_tokens）除以总响应时间，
+     * 而非逐 chunk 累加数。需要服务端返回 usage 才有值，否则返回 -1。</p>
+     *
+     * @return token/秒，异常返回 -1
+     */
+    public double getRealTokenPerSec() {
+        if (outputTokens <= 0 || requestEndTime <= 0 || requestStartTime <= 0) {
+            return -1d;
+        }
+        long duration = requestEndTime - requestStartTime;
+        if (duration <= 0) {
+            return -1d;
+        }
+        return (double) outputTokens / duration * 1000;
+    }
+
+    /**
      * 返回指标的可读字符串表示。
      *
      * @return 包含所有指标的格式化字符串
@@ -145,6 +183,8 @@ public class SseMetrics {
                 ", firstByteTime=" + firstByteTime +
                 ", firstTokenTime=" + firstTokenTime +
                 ", lastTokenTime=" + lastTokenTime +
+                ", maxTokenGap=" + maxTokenGap +
+                ", stallCount=" + stallCount +
                 ", requestEndTime=" + requestEndTime +
                 ", inputTokens=" + inputTokens +
                 ", outputTokens=" + outputTokens +
@@ -154,6 +194,8 @@ public class SseMetrics {
                 ", TotalRT(ms)=" + getTotalRT() +
                 ", TPOT(ms/token)=" + String.format("%.2f",getTPOT()) +
                 ", TokenPerSec(token/s)=" + String.format("%.2f",getTokenPerSec()) +
+                ", RealTokenPerSec(token/s)=" + String.format("%.2f",getRealTokenPerSec()) +
+                ", TTFT-TTFB(ms)=" + getTTFTMinusTTFB() +
                 ", streamingDuration(ms)=" + getStreamingDuration() +
                 '}';
     }

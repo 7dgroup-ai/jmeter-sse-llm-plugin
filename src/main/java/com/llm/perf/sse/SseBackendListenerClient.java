@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * SSE-LLM 指标后端监听器客户端。
@@ -71,6 +72,10 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
     private static final int DEFAULT_FLUSH_INTERVAL_MS = 5000;
     /** 默认批次大小：50 条 */
     private static final int DEFAULT_BATCH_SIZE = 50;
+    /** 缓冲区上限：后端不可用时防止无界增长导致 OOM */
+    private static final int MAX_BUFFER_SIZE = 100_000;
+    /** 溢出告警节流间隔（毫秒），避免高频刷日志 */
+    private static final long BUFFER_OVERFLOW_WARN_INTERVAL_MS = 10_000;
 
     /** 推送目标 URL */
     private String endpointUrl;
@@ -85,12 +90,16 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
 
     /** 数据缓冲区，线程安全的无界队列 */
     private final ConcurrentLinkedQueue<JsonObject> buffer = new ConcurrentLinkedQueue<>();
+    /** 缓冲区元素计数（ConcurrentLinkedQueue.size() 为 O(n)，热路径用原子计数代替） */
+    private final AtomicInteger bufferSize = new AtomicInteger();
     /** 定时推送调度器 */
     private ScheduledExecutorService scheduler;
     /** HTTP 客户端 */
     private CloseableHttpClient httpClient;
     /** JSON 序列化器 */
     private final Gson gson = new Gson();
+    /** 上次缓冲区溢出告警时间，用于节流 */
+    private long lastBufferOverflowWarnMs;
 
     /**
      * 初始化后端监听器。
@@ -143,7 +152,7 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
         if (httpClient != null) {
             httpClient.close();
         }
-        log.info("SseBackendListener teardown: total buffered={}", buffer.size());
+        log.info("SseBackendListener teardown: total buffered={}", bufferSize.get());
     }
 
     /**
@@ -165,10 +174,25 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
                 SseMetrics metrics = gson.fromJson(data, SseMetrics.class);
                 JsonObject point = buildPoint(result, metrics);
                 buffer.offer(point);
+                int size = bufferSize.incrementAndGet();
 
                 // 达到批次大小时立即推送
-                if (buffer.size() >= batchSize) {
+                if (size >= batchSize) {
                     flush();
+                }
+
+                // 后端不可用且持续推送失败时，防止缓冲区无限增长：丢弃最旧数据
+                if (bufferSize.get() > MAX_BUFFER_SIZE) {
+                    int dropped = 0;
+                    while (bufferSize.get() > MAX_BUFFER_SIZE && pollPoint() != null) {
+                        dropped++;
+                    }
+                    long now = System.currentTimeMillis();
+                    if (dropped > 0 && now - lastBufferOverflowWarnMs > BUFFER_OVERFLOW_WARN_INTERVAL_MS) {
+                        lastBufferOverflowWarnMs = now;
+                        log.warn("Backend buffer overflow, dropped {} oldest points (max {})",
+                                dropped, MAX_BUFFER_SIZE);
+                    }
                 }
             } catch (Exception e) {
                 log.warn("Failed to parse SSE metrics: {}", e.getMessage());
@@ -200,10 +224,14 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
         fields.addProperty("ttfb", metrics.getTTFB());
         fields.addProperty("tpot", metrics.getTPOT());
         fields.addProperty("token_per_sec", metrics.getTokenPerSec());
+        fields.addProperty("real_token_per_sec", metrics.getRealTokenPerSec());
         fields.addProperty("total_rt", metrics.getTotalRT());
+        fields.addProperty("ttft_minus_ttfb", metrics.getTTFTMinusTTFB());
         fields.addProperty("input_tokens", metrics.inputTokens);
         fields.addProperty("output_tokens", metrics.outputTokens);
         fields.addProperty("token_count", metrics.tokenCount);
+        fields.addProperty("max_token_gap", metrics.maxTokenGap);
+        fields.addProperty("stall_count", metrics.stallCount);
         fields.addProperty("response_time", result.getTime());
         fields.addProperty("latency", result.getLatency());
         fields.addProperty("connect_time", result.getConnectTime());
@@ -221,13 +249,13 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
      * <p>从缓冲区取出最多 1000 条数据，构建 JSON 数组并 POST 到 endpointUrl。
      * 如果推送失败（HTTP 状态码 >= 300 或异常），数据将放回缓冲区重试。</p>
      */
-    private void flush() {
-        if (buffer.isEmpty() || endpointUrl.isEmpty()) return;
+    private synchronized void flush() {
+        if (bufferSize.get() <= 0 || endpointUrl.isEmpty()) return;
 
         // 取出缓冲数据，最多 1000 条
         List<JsonObject> batch = new ArrayList<>();
         JsonObject item;
-        while ((item = buffer.poll()) != null) {
+        while ((item = pollPoint()) != null) {
             batch.add(item);
             if (batch.size() >= 1000) break;
         }
@@ -246,14 +274,37 @@ public class SseBackendListenerClient extends AbstractBackendListenerClient impl
             int code = httpClient.execute(post, response -> response.getStatusLine().getStatusCode());
             if (code >= 300) {
                 log.warn("Backend flush returned HTTP {}", code);
-                buffer.addAll(batch);  // 失败时放回缓冲区
+                requeue(batch);  // 失败时放回缓冲区
             } else {
                 log.debug("Flushed {} points to {}", batch.size(), endpointUrl);
             }
         } catch (Exception e) {
             log.error("Backend flush failed: {}", e.getMessage());
-            buffer.addAll(batch);  // 异常时放回缓冲区
+            requeue(batch);  // 异常时放回缓冲区
         }
+    }
+
+    /**
+     * 从缓冲区取出一个元素，并同步维护原子计数。
+     *
+     * @return 取出的数据点，队列为空返回 null
+     */
+    private JsonObject pollPoint() {
+        JsonObject point = buffer.poll();
+        if (point != null) {
+            bufferSize.decrementAndGet();
+        }
+        return point;
+    }
+
+    /**
+     * 将一批数据放回缓冲区，并同步维护原子计数。
+     *
+     * @param batch 待放回的数据点列表
+     */
+    private void requeue(List<JsonObject> batch) {
+        buffer.addAll(batch);
+        bufferSize.addAndGet(batch.size());
     }
 
     /**

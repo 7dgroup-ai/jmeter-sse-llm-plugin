@@ -11,12 +11,17 @@ import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.util.EntityUtils;
 import org.apache.jmeter.samplers.AbstractSampler;
 import org.apache.jmeter.samplers.Entry;
 import org.apache.jmeter.samplers.SampleResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 
@@ -37,6 +42,8 @@ import java.nio.charset.StandardCharsets;
  * Date  2025-09-03
  */
 public class SseStreamSampler extends AbstractSampler {
+    /** 日志记录器，可通过 jmeter.properties 中 log_level.com.llm.perf.sse=DEBUG 控制输出 */
+    private static final Logger log = LoggerFactory.getLogger(SseStreamSampler.class);
     /** URL 配置属性键 */
     public static final String URL = "SseStreamSampler.url";
     /** 请求体配置属性键 */
@@ -57,6 +64,8 @@ public class SseStreamSampler extends AbstractSampler {
     public static final String API_TYPE_CLAUDE = "claude";
     /** API 类型常量：Google Gemini */
     public static final String API_TYPE_GEMINI = "gemini";
+    /** 卡顿判定阈值（毫秒）：相邻 token 间隔超过该值计为一次卡顿 */
+    private static final long STALL_THRESHOLD_MS = 1000;
 
     /** HTTP 连接池管理器，支持并发请求 */
     private static final PoolingHttpClientConnectionManager CONNECTION_MANAGER = new PoolingHttpClientConnectionManager();
@@ -97,6 +106,9 @@ public class SseStreamSampler extends AbstractSampler {
 
         SampleResult mainResult = new SampleResult();
         mainResult.setSampleLabel(getName());
+        mainResult.setDataType(SampleResult.TEXT);
+        // 启动 JMeter 计时，否则 Aggregate Report / BackendListener 的响应时间恒为 0
+        mainResult.sampleStart();
 
         String urlStr = getPropertyAsString(URL);
         String body = getPropertyAsString(REQUEST_BODY);
@@ -108,16 +120,19 @@ public class SseStreamSampler extends AbstractSampler {
         if (urlStr == null || urlStr.trim().isEmpty()) {
             mainResult.setSuccessful(false);
             mainResult.setResponseMessage("URL不能为空");
+            mainResult.sampleEnd();
             return mainResult;
         }
         if (!urlStr.startsWith("http://") && !urlStr.startsWith("https://")) {
             mainResult.setSuccessful(false);
             mainResult.setResponseMessage("URL必须以http://或https://开头");
+            mainResult.sampleEnd();
             return mainResult;
         }
         if (body == null || body.trim().isEmpty()) {
             mainResult.setSuccessful(false);
             mainResult.setResponseMessage("请求体不能为空");
+            mainResult.sampleEnd();
             return mainResult;
         }
 
@@ -140,36 +155,49 @@ public class SseStreamSampler extends AbstractSampler {
                 }
             }
         }
+        // 未显式指定 Content-Type 时默认使用 application/json（LLM API 的常规要求）
+        if (httpPost.getFirstHeader("Content-Type") == null) {
+            httpPost.setHeader("Content-Type", "application/json");
+        }
 
         httpPost.setEntity(new StringEntity(body, StandardCharsets.UTF_8));
 
         BufferedReader reader = null;
+        HttpEntity entity = null;
         boolean success = true;
-        String responseMsg = "";
+        String responseMsg = "OK";
 
         try {
             HttpResponse response = HTTP_CLIENT.execute(httpPost);
             int code = response.getStatusLine().getStatusCode();
-            if (code >= 400) {
-                // HTTP 错误
+            if (code >= 300) {
+                // HTTP 错误（含 3xx 重定向，POST 不会被 HttpClient 自动跟随）
                 success = false;
                 responseMsg = "HTTP error code:" + code;
+                // 及时消费/关闭响应体，归还连接到连接池，避免连接泄漏
+                HttpEntity errEntity = response.getEntity();
+                if (errEntity != null) {
+                    EntityUtils.consumeQuietly(errEntity);
+                }
             } else {
                 // 成功响应，开始解析 SSE 流
-                HttpEntity entity = response.getEntity();
+                entity = response.getEntity();
                 if (entity != null) {
-                    reader = new BufferedReader(new InputStreamReader(entity.getContent(), StandardCharsets.UTF_8));
+                    // 用计时流包装底层输入流，在真正读到首个字节时记录 TTFB
+                    InputStream timedStream = new FirstByteTimingInputStream(entity.getContent(), metrics);
+                    reader = new BufferedReader(new InputStreamReader(timedStream, StandardCharsets.UTF_8));
                     String line;
-                    boolean firstByte = true;
+                    // 仅开启 DEBUG 日志时才累加流式内容，避免无谓的内存与字符串开销
+                    boolean debugLog = log.isDebugEnabled();
+                    StringBuilder streamContent = debugLog ? new StringBuilder() : null;
 
                     // 逐行读取 SSE 流数据
                     while ((line = reader.readLine()) != null) {
                         long now = System.currentTimeMillis();
 
-                        // 记录首字节时间（TTFB）
-                        if (firstByte) {
-                            metrics.firstByteTime = now;
-                            firstByte = false;
+                        // 记录每条原始 SSE 行（DEBUG 级别，用于逐 chunk 跟踪流）
+                        if (log.isDebugEnabled()) {
+                            log.debug("[SSE][{}] chunk: {}", getName(), line);
                         }
 
                         // 解析 SSE 事件
@@ -183,35 +211,69 @@ public class SseStreamSampler extends AbstractSampler {
                         // 根据 API 类型处理 token 内容
                         switch (apiType) {
                             case API_TYPE_DIFY:
-                                processDifyContent(json, now, metrics);
+                                processDifyContent(json, now, metrics, streamContent);
                                 break;
                             case API_TYPE_CLAUDE:
-                                processClaudeContent(json, now, metrics);
+                                processClaudeContent(json, now, metrics, streamContent);
                                 break;
                             case API_TYPE_GEMINI:
-                                processGeminiContent(json, now, metrics);
+                                processGeminiContent(json, now, metrics, streamContent);
                                 break;
                             default:
                                 // OpenAI 格式
-                                processDeltaContent(json, now, metrics);
+                                processDeltaContent(json, now, metrics, streamContent);
                                 break;
                         }
                         // 处理 usage 信息（token 统计）
                         processUsage(json, metrics);
+                    }
+
+                    // 输出完整流式内容，用于验证输出是否正确（DEBUG 级别）
+                    if (debugLog) {
+                        log.debug("[SSE][{}] full stream content:\n{}", getName(), streamContent.toString());
                     }
                 }
             }
         } catch (Exception e) {
             success = false;
             responseMsg = e.getMessage();
+            log.error("[SSE][{}] request failed: {}", getName(), e.getMessage(), e);
         } finally {
-            closeQuietly(reader);
+            if (reader != null) {
+                closeQuietly(reader);
+            } else if (entity != null) {
+                // reader 未创建成功时仍需消费响应体，避免连接泄漏
+                EntityUtils.consumeQuietly(entity);
+            }
         }
 
         metrics.requestEndTime = System.currentTimeMillis();
 
+        // 输出本次采样摘要（INFO 级别，用于判断流式结果是否正常）
+        if (success) {
+            if (log.isInfoEnabled()) {
+                log.info("[SSE][{}] url={}, success={}, in/outTokens={}/{}, totalCount={}, TTFT={}ms, TTFB={}ms, TPOT={}ms/token, Token/s={}, RealToken/s={}, MaxGap={}ms, Stall={}, TotalRT={}ms",
+                        getName(), urlStr, success, metrics.inputTokens, metrics.outputTokens, metrics.tokenCount,
+                        metrics.getTTFT(), metrics.getTTFB(),
+                        String.format("%.2f", metrics.getTPOT()),
+                        String.format("%.2f", metrics.getTokenPerSec()),
+                        String.format("%.2f", metrics.getRealTokenPerSec()),
+                        metrics.maxTokenGap, metrics.stallCount,
+                        metrics.getTotalRT());
+            }
+        } else {
+            if (log.isWarnEnabled()) {
+                log.warn("[SSE][{}] url={}, success={}, responseMsg={}", getName(), urlStr, success, responseMsg);
+            }
+        }
+
         mainResult.setSuccessful(success);
         mainResult.setResponseMessage(responseMsg);
+        // 延迟取首字节时间（JMeter 语义：latency = time to first byte）
+        long ttfb = metrics.getTTFB();
+        if (ttfb >= 0) {
+            mainResult.setLatency(ttfb);
+        }
 
         // 将指标 JSON 写入 responseData（供 Listener 和 BackendListener 读取）
         String metricsJson = GSON_LOCAL.get().toJson(metrics);
@@ -227,8 +289,14 @@ public class SseStreamSampler extends AbstractSampler {
         sb.append("inputTokens:").append(metrics.inputTokens).append("\n");
         sb.append("outputTokens:").append(metrics.outputTokens).append("\n");
         sb.append("tokenCount:").append(metrics.tokenCount).append("\n");
+        sb.append("RealToken/s:").append(String.format("%.2f", metrics.getRealTokenPerSec())).append("\n");
+        sb.append("TTFT-TTFB(ms):").append(metrics.getTTFTMinusTTFB()).append("\n");
+        sb.append("MaxGap(ms):").append(metrics.maxTokenGap).append("\n");
+        sb.append("Stall(>1s):").append(metrics.stallCount).append("\n");
         mainResult.setSamplerData(sb.toString());
 
+        // 结束 JMeter 计时，填充响应时间/结束时间戳
+        mainResult.sampleEnd();
         return mainResult;
     }
 
@@ -243,8 +311,9 @@ public class SseStreamSampler extends AbstractSampler {
      * @param json SSE 事件的 JSON payload
      * @param now 当前时间戳（毫秒）
      * @param metrics 指标收集器
+     * @param streamContent 流式内容累加器
      */
-    private void processDeltaContent(JsonObject json, long now, SseMetrics metrics) {
+    private void processDeltaContent(JsonObject json, long now, SseMetrics metrics, StringBuilder streamContent) {
         if (!json.has("choices") || json.get("choices").isJsonNull()) return;
         JsonArray choicesArr = json.getAsJsonArray("choices");
         if (choicesArr == null || choicesArr.size() == 0) return;
@@ -257,12 +326,8 @@ public class SseStreamSampler extends AbstractSampler {
 
         String content = delta.get("content").getAsString();
         if (content != null && !content.isEmpty()) {
-            metrics.tokenCount++;
-            metrics.lastTokenTime = now;
-            // 首次收到有效 content 时记录 TTFT
-            if (metrics.firstTokenTime == -1) {
-                metrics.firstTokenTime = now;
-            }
+            appendStreamContent(streamContent, content);
+            recordToken(now, metrics);
         }
     }
 
@@ -286,8 +351,9 @@ public class SseStreamSampler extends AbstractSampler {
      * @param json SSE 事件的 JSON payload
      * @param now 当前时间戳（毫秒）
      * @param metrics 指标收集器
+     * @param streamContent 流式内容累加器
      */
-    private void processDifyContent(JsonObject json, long now, SseMetrics metrics) {
+    private void processDifyContent(JsonObject json, long now, SseMetrics metrics, StringBuilder streamContent) {
         if (!json.has("event") || json.get("event").isJsonNull()) return;
 
         String eventType = json.get("event").getAsString();
@@ -305,8 +371,16 @@ public class SseStreamSampler extends AbstractSampler {
                 }
                 break;
             case "text_chunk":
-                // 文本块事件，从 text 字段提取内容
-                if (json.has("text") && !json.get("text").isJsonNull()) {
+                // 文本块事件（chatflow/workflow 模式）：text 嵌套在 data 字段中
+                // {"event":"text_chunk","data":{"position":1,"text":"..."}}
+                if (json.has("data") && !json.get("data").isJsonNull()) {
+                    JsonObject dataObj = json.getAsJsonObject("data");
+                    if (dataObj.has("text") && !dataObj.get("text").isJsonNull()) {
+                        content = dataObj.get("text").getAsString();
+                    }
+                }
+                // 兼容旧格式：顶层 text 字段
+                if (content == null && json.has("text") && !json.get("text").isJsonNull()) {
                     content = json.get("text").getAsString();
                 }
                 break;
@@ -317,36 +391,71 @@ public class SseStreamSampler extends AbstractSampler {
 
         // 处理提取到的内容
         if (content != null && !content.isEmpty()) {
-            metrics.tokenCount++;
-            metrics.lastTokenTime = now;
-            // 首次收到有效内容时记录 TTFT
-            if (metrics.firstTokenTime == -1) {
-                metrics.firstTokenTime = now;
-            }
+            appendStreamContent(streamContent, content);
+            recordToken(now, metrics);
         }
     }
 
     /**
-     * 处理 SSE 事件中的 usage 信息。
+     * 处理各类 API 的 usage（token 统计）信息。
      *
-     * <p>OpenAI 格式的 usage 结构：</p>
-     * <pre>
-     * data: {"usage":{"prompt_tokens":10,"completion_tokens":20}}
-     * </pre>
+     * <p>不同 API 的 usage 位置和字段名不同，统一兜底解析：</p>
+     * <ul>
+     *   <li>OpenAI：顶层 usage（prompt_tokens / completion_tokens），需要在请求体中包含
+     *       {@code "stream_options":{"include_usage":true}} 才会返回 usage chunk</li>
+     *   <li>Dify：metadata.usage（prompt_tokens / completion_tokens），由 message_end 事件携带</li>
+     *   <li>Gemini：顶层 usageMetadata / usage_metadata（promptTokenCount / candidatesTokenCount）</li>
+     *   <li>Claude：message_start / message_delta 事件中的 usage 字段，在
+     *       {@link #processClaudeContent} 中解析</li>
+     * </ul>
      *
      * @param json SSE 事件的 JSON payload
      * @param metrics 指标收集器
      */
     private void processUsage(JsonObject json, SseMetrics metrics) {
-        if (!json.has("usage") || json.get("usage").isJsonNull()) return;
-        JsonObject usage = json.getAsJsonObject("usage");
+        JsonObject usage = null;
+
+        // 1) 顶层 usage（OpenAI / 部分兼容服务）
+        if (json.has("usage") && !json.get("usage").isJsonNull()) {
+            usage = json.getAsJsonObject("usage");
+        }
+        // 2) Dify：metadata.usage
+        if (usage == null && json.has("metadata") && !json.get("metadata").isJsonNull()) {
+            JsonObject metadata = json.getAsJsonObject("metadata");
+            if (metadata.has("usage") && !metadata.get("usage").isJsonNull()) {
+                usage = metadata.getAsJsonObject("usage");
+            }
+        }
+        // 3) Gemini：usageMetadata / usage_metadata
+        if (usage == null) {
+            if (json.has("usageMetadata") && !json.get("usageMetadata").isJsonNull()) {
+                usage = json.getAsJsonObject("usageMetadata");
+            } else if (json.has("usage_metadata") && !json.get("usage_metadata").isJsonNull()) {
+                usage = json.getAsJsonObject("usage_metadata");
+            }
+        }
         if (usage == null) return;
 
+        // OpenAI 命名：prompt_tokens / completion_tokens
         if (usage.has("prompt_tokens")) {
             metrics.inputTokens = usage.get("prompt_tokens").getAsLong();
         }
         if (usage.has("completion_tokens")) {
             metrics.outputTokens = usage.get("completion_tokens").getAsLong();
+        }
+        // Gemini 命名：promptTokenCount / candidatesTokenCount
+        if (usage.has("promptTokenCount")) {
+            metrics.inputTokens = usage.get("promptTokenCount").getAsLong();
+        }
+        if (usage.has("candidatesTokenCount")) {
+            metrics.outputTokens = usage.get("candidatesTokenCount").getAsLong();
+        }
+        // Claude 命名：input_tokens / output_tokens
+        if (usage.has("input_tokens")) {
+            metrics.inputTokens = usage.get("input_tokens").getAsLong();
+        }
+        if (usage.has("output_tokens")) {
+            metrics.outputTokens = usage.get("output_tokens").getAsLong();
         }
     }
 
@@ -379,8 +488,9 @@ public class SseStreamSampler extends AbstractSampler {
      * @param json SSE 事件的 JSON payload
      * @param now 当前时间戳（毫秒）
      * @param metrics 指标收集器
+     * @param streamContent 流式内容累加器
      */
-    private void processClaudeContent(JsonObject json, long now, SseMetrics metrics) {
+    private void processClaudeContent(JsonObject json, long now, SseMetrics metrics, StringBuilder streamContent) {
         if (!json.has("type")) return;
 
         String eventType = json.get("type").getAsString();
@@ -394,11 +504,22 @@ public class SseStreamSampler extends AbstractSampler {
 
             String text = delta.get("text").getAsString();
             if (text != null && !text.isEmpty()) {
-                metrics.tokenCount++;
-                metrics.lastTokenTime = now;
-                // 首次收到有效内容时记录 TTFT
-                if (metrics.firstTokenTime == -1) {
-                    metrics.firstTokenTime = now;
+                appendStreamContent(streamContent, text);
+                recordToken(now, metrics);
+            }
+        }
+        // 处理 message_start 事件，提取 input_tokens（usage 嵌套在 message 字段中）
+        if ("message_start".equals(eventType)) {
+            if (json.has("message") && !json.get("message").isJsonNull()) {
+                JsonObject message = json.getAsJsonObject("message");
+                if (message.has("usage") && !message.get("usage").isJsonNull()) {
+                    JsonObject usage = message.getAsJsonObject("usage");
+                    if (usage.has("input_tokens")) {
+                        metrics.inputTokens = usage.get("input_tokens").getAsLong();
+                    }
+                    if (usage.has("output_tokens")) {
+                        metrics.outputTokens = usage.get("output_tokens").getAsLong();
+                    }
                 }
             }
         }
@@ -429,8 +550,9 @@ public class SseStreamSampler extends AbstractSampler {
      * @param json SSE 事件的 JSON payload
      * @param now 当前时间戳（毫秒）
      * @param metrics 指标收集器
+     * @param streamContent 流式内容累加器
      */
-    private void processGeminiContent(JsonObject json, long now, SseMetrics metrics) {
+    private void processGeminiContent(JsonObject json, long now, SseMetrics metrics, StringBuilder streamContent) {
         if (!json.has("event_type")) return;
 
         String eventType = json.get("event_type").getAsString();
@@ -444,27 +566,124 @@ public class SseStreamSampler extends AbstractSampler {
 
             String text = delta.get("text").getAsString();
             if (text != null && !text.isEmpty()) {
-                metrics.tokenCount++;
-                metrics.lastTokenTime = now;
-                // 首次收到有效内容时记录 TTFT
-                if (metrics.firstTokenTime == -1) {
-                    metrics.firstTokenTime = now;
-                }
+                appendStreamContent(streamContent, text);
+                recordToken(now, metrics);
             }
         }
-        // 处理 interaction.completed 事件，提取 usage 信息
-        else if ("interaction_completed".equals(eventType) || "interaction.completed".equals(eventType)) {
-            if (json.has("usageMetadata") && !json.get("usageMetadata").isJsonNull()) {
-                JsonObject usage = json.getAsJsonObject("usageMetadata");
-                if (usage.has("promptTokenCount")) {
-                    metrics.inputTokens = usage.get("promptTokenCount").getAsLong();
-                }
-                if (usage.has("candidatesTokenCount")) {
-                    metrics.outputTokens = usage.get("candidatesTokenCount").getAsLong();
-                }
-                if (usage.has("totalTokenCount")) {
-                    metrics.tokenCount = usage.get("totalTokenCount").getAsLong();
-                }
+        // 处理 usage 信息（token 统计）
+        else if ("interaction_completed".equals(eventType) || "interaction.completed".equals(eventType)
+                || "step.completed".equals(eventType) || "step_completed".equals(eventType)
+                || "message.completed".equals(eventType) || "message_completed".equals(eventType)) {
+            parseGeminiUsage(json, metrics);
+        }
+    }
+
+    /**
+     * 解析 Gemini 的 usageMetadata 信息。
+     *
+     * <p>当对象包含 usageMetadata 时，提取 token 统计字段：</p>
+     * <ul>
+     *   <li>promptTokenCount - 输入 token 数</li>
+     *   <li>candidatesTokenCount - 输出 token 数</li>
+     * </ul>
+     *
+     * <p>注意：不处理 totalTokenCount，避免覆盖 {@code tokenCount}（该字段语义为
+     * "逐 chunk 累加数"，TPOT / Token/s 依赖其一致的语义；真实总吞吐用 outputTokens）。</p>
+     *
+     * @param json SSE 事件的 JSON payload
+     * @param metrics 指标收集器
+     */
+    private void parseGeminiUsage(JsonObject json, SseMetrics metrics) {
+        JsonObject usage = null;
+        if (json.has("usageMetadata") && !json.get("usageMetadata").isJsonNull()) {
+            usage = json.getAsJsonObject("usageMetadata");
+        } else if (json.has("usage_metadata") && !json.get("usage_metadata").isJsonNull()) {
+            usage = json.getAsJsonObject("usage_metadata");
+        }
+        if (usage == null) return;
+
+        if (usage.has("promptTokenCount")) {
+            metrics.inputTokens = usage.get("promptTokenCount").getAsLong();
+        }
+        if (usage.has("candidatesTokenCount")) {
+            metrics.outputTokens = usage.get("candidatesTokenCount").getAsLong();
+        }
+    }
+
+    /**
+     * 追加流式内容到日志累加器（DEBUG 未开启时 streamContent 为 null，跳过）。
+     *
+     * @param streamContent 累加器，可能为 null
+     * @param text 追加的文本
+     */
+    private void appendStreamContent(StringBuilder streamContent, String text) {
+        if (streamContent != null) {
+            streamContent.append(text);
+        }
+    }
+
+    /**
+     * 记录一次 token/content 到达，更新 TTFT、lastTokenTime、token 间隔与卡顿统计。
+     *
+     * @param now 当前时间戳（毫秒）
+     * @param metrics 指标收集器
+     */
+    private void recordToken(long now, SseMetrics metrics) {
+        if (metrics.firstTokenTime == -1) {
+            // 首次收到有效内容时记录 TTFT
+            metrics.firstTokenTime = now;
+        } else {
+            // 计算相邻 token 间隔，用于断流/卡顿检测
+            long gap = now - metrics.lastTokenTime;
+            if (gap > metrics.maxTokenGap) {
+                metrics.maxTokenGap = gap;
+            }
+            if (gap > STALL_THRESHOLD_MS) {
+                metrics.stallCount++;
+            }
+        }
+        metrics.lastTokenTime = now;
+        metrics.tokenCount++;
+    }
+
+    /**
+     * 首字节计时输入流。
+     *
+     * <p>包装响应体输入流，在首次真正读到字节时记录 TTFB，
+     * 避免用 {@code BufferedReader.readLine()} 返回时间近似（会把 TTFB 记为
+     * 首个完整 SSE 行的到达时间，而非首字节时间）。</p>
+     */
+    private static final class FirstByteTimingInputStream extends FilterInputStream {
+        private final SseMetrics metrics;
+        private boolean firstByteRecorded = false;
+
+        FirstByteTimingInputStream(InputStream in, SseMetrics metrics) {
+            super(in);
+            this.metrics = metrics;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int b = super.read();
+            if (b >= 0) {
+                recordFirstByte();
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int n = super.read(b, off, len);
+            if (n > 0) {
+                recordFirstByte();
+            }
+            return n;
+        }
+
+        private void recordFirstByte() {
+            if (!firstByteRecorded) {
+                metrics.firstByteTime = System.currentTimeMillis();
+                firstByteRecorded = true;
             }
         }
     }

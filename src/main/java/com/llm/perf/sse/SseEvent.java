@@ -21,6 +21,8 @@ import com.google.gson.stream.JsonReader;
 public class SseEvent {
     /** SSE 流结束标记 */
     public static final String DONE = "[DONE]";
+    /** 复用解析器（Gson 2.8.x 无状态，可安全共享），避免每行 new */
+    private static final com.google.gson.JsonParser JSON_PARSER = new com.google.gson.JsonParser();
     /** 解析出的 data 字段内容 */
     private String data;
 
@@ -62,10 +64,9 @@ public class SseEvent {
             return null;
         }
         try {
-            com.google.gson.JsonParser parser = new com.google.gson.JsonParser();
             try (JsonReader reader = new JsonReader(new java.io.StringReader(data))) {
                 reader.setLenient(true);
-                return parser.parse(reader).getAsJsonObject();
+                return JSON_PARSER.parse(reader).getAsJsonObject();
             }
         } catch (Exception e) {
             return null;
